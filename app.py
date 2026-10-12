@@ -1,54 +1,151 @@
 import os
+import math
+import time
 import requests
-from flask import Flask, request
+from flask import Flask, request, jsonify
 
 app = Flask(__name__)
+
+# ============================================================
+# CONFIGURACION
+# ============================================================
 
 VERIFY_TOKEN = os.environ.get("VERIFY_TOKEN", "tuauto2026")
 WHATSAPP_TOKEN = os.environ.get("WHATSAPP_TOKEN", "")
 PHONE_NUMBER_ID = os.environ.get("PHONE_NUMBER_ID", "")
 GRAPH_API_VERSION = "v24.0"
 
-# =========================
-# DATOS TEMPORALES
-# =========================
-
-clientes = {}
-
-# Choferes autorizados para la prueba
-choferes = {
+# Choferes autorizados para esta prueba
+CHOFERES_AUTORIZADOS = {
     "5493446614703": {
-        "nombre": "Chofer 1",
-        "estado": "DESCONECTADO",
-        "ubicacion": None
+        "nombre": "Chofer 1"
     },
     "5493446411551": {
-        "nombre": "Chofer 2",
-        "estado": "DESCONECTADO",
-        "ubicacion": None
+        "nombre": "Chofer 2"
     }
 }
 
+# ============================================================
+# MEMORIA TEMPORAL
+# Para esta etapa de prueba.
+# Luego se reemplaza por una base de datos persistente.
+# ============================================================
 
-@app.route("/", methods=["GET"])
-def inicio():
-    return "TU AUTO BOT ONLINE", 200
+clientes = {}
+viajes = {}
+contador_viajes = 1
+
+choferes = {}
+
+for numero, datos in CHOFERES_AUTORIZADOS.items():
+    choferes[numero] = {
+        "numero": numero,
+        "nombre": datos["nombre"],
+        "activo": False,
+        "estado": "DESCONECTADO",
+        "latitud": None,
+        "longitud": None,
+        "viaje_actual": None,
+        "ultima_actualizacion": None
+    }
 
 
-@app.route("/webhook", methods=["GET"])
-def verificar_webhook():
-    mode = request.args.get("hub.mode")
-    token = request.args.get("hub.verify_token")
-    challenge = request.args.get("hub.challenge")
+# ============================================================
+# UTILIDADES
+# ============================================================
 
-    if mode == "subscribe" and token == VERIFY_TOKEN:
-        return challenge, 200
+def ahora():
+    return int(time.time())
 
-    return "Error de verificacion", 403
 
+def distancia_km(lat1, lon1, lat2, lon2):
+    """
+    Calcula distancia aproximada entre dos coordenadas
+    utilizando la formula de Haversine.
+    """
+
+    radio_tierra = 6371.0
+
+    lat1 = math.radians(float(lat1))
+    lon1 = math.radians(float(lon1))
+    lat2 = math.radians(float(lat2))
+    lon2 = math.radians(float(lon2))
+
+    dlat = lat2 - lat1
+    dlon = lon2 - lon1
+
+    a = (
+        math.sin(dlat / 2) ** 2
+        + math.cos(lat1)
+        * math.cos(lat2)
+        * math.sin(dlon / 2) ** 2
+    )
+
+    c = 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
+
+    return radio_tierra * c
+
+
+def obtener_choferes_disponibles(origen):
+    disponibles = []
+
+    if not origen:
+        return disponibles
+
+    lat_cliente = origen.get("latitud")
+    lon_cliente = origen.get("longitud")
+
+    if lat_cliente is None or lon_cliente is None:
+        return disponibles
+
+    for numero, chofer in choferes.items():
+
+        if not chofer["activo"]:
+            continue
+
+        if chofer["estado"] != "DISPONIBLE":
+            continue
+
+        if chofer["latitud"] is None or chofer["longitud"] is None:
+            continue
+
+        distancia = distancia_km(
+            lat_cliente,
+            lon_cliente,
+            chofer["latitud"],
+            chofer["longitud"]
+        )
+
+        disponibles.append({
+            "numero": numero,
+            "nombre": chofer["nombre"],
+            "distancia_km": round(distancia, 2)
+        })
+
+    disponibles.sort(key=lambda x: x["distancia_km"])
+
+    return disponibles
+
+
+# ============================================================
+# WHATSAPP
+# ============================================================
 
 def enviar_mensaje(numero, texto):
-    url = f"https://graph.facebook.com/{GRAPH_API_VERSION}/{PHONE_NUMBER_ID}/messages"
+    """
+    Si WhatsApp/WAIA todavia no esta conectado,
+    el motor igualmente funciona.
+    """
+
+    if not WHATSAPP_TOKEN or not PHONE_NUMBER_ID:
+        print(f"[SIMULACION MENSAJE] Para {numero}: {texto}")
+        return False
+
+    url = (
+        f"https://graph.facebook.com/"
+        f"{GRAPH_API_VERSION}/"
+        f"{PHONE_NUMBER_ID}/messages"
+    )
 
     headers = {
         "Authorization": f"Bearer {WHATSAPP_TOKEN}",
@@ -74,26 +171,32 @@ def enviar_mensaje(numero, texto):
         )
 
         print(
-            "ENVIO:",
-            numero,
+            "WHATSAPP:",
             respuesta.status_code,
             respuesta.text
         )
 
+        return respuesta.ok
+
     except Exception as error:
-        print("ERROR ENVIANDO MENSAJE:", error)
+        print("ERROR WHATSAPP:", error)
+        return False
 
 
-def pedir_ubicacion(numero, texto=None):
+def pedir_ubicacion(numero):
 
-    if texto is None:
-        texto = (
-            "🚗 TU AUTO\n\n"
-            "Para buscarte necesito saber dónde estás.\n\n"
-            "Tocá el botón de abajo y compartí tu ubicación."
+    if not WHATSAPP_TOKEN or not PHONE_NUMBER_ID:
+        print(
+            f"[SIMULACION UBICACION] "
+            f"Solicitar ubicacion a {numero}"
         )
+        return False
 
-    url = f"https://graph.facebook.com/{GRAPH_API_VERSION}/{PHONE_NUMBER_ID}/messages"
+    url = (
+        f"https://graph.facebook.com/"
+        f"{GRAPH_API_VERSION}/"
+        f"{PHONE_NUMBER_ID}/messages"
+    )
 
     headers = {
         "Authorization": f"Bearer {WHATSAPP_TOKEN}",
@@ -107,7 +210,10 @@ def pedir_ubicacion(numero, texto=None):
         "interactive": {
             "type": "location_request_message",
             "body": {
-                "text": texto
+                "text":
+                    "🚗 TU AUTO\n\n"
+                    "Para buscarte necesito saber dónde estás.\n\n"
+                    "Tocá el botón y compartí tu ubicación."
             },
             "action": {
                 "name": "send_location"
@@ -124,60 +230,241 @@ def pedir_ubicacion(numero, texto=None):
         )
 
         print(
-            "PEDIDO UBICACION:",
-            numero,
+            "WHATSAPP UBICACION:",
             respuesta.status_code,
             respuesta.text
         )
 
+        return respuesta.ok
+
     except Exception as error:
-        print("ERROR PIDIENDO UBICACION:", error)
+        print("ERROR UBICACION:", error)
+        return False
 
 
-# =========================
-# CHOFERES
-# =========================
+# ============================================================
+# MOTOR DE CHOFERES
+# ============================================================
+
+def activar_chofer(numero):
+
+    chofer = choferes.get(numero)
+
+    if not chofer:
+        return False
+
+    chofer["activo"] = True
+    chofer["estado"] = "DISPONIBLE"
+    chofer["ultima_actualizacion"] = ahora()
+
+    return True
+
+
+def desconectar_chofer(numero):
+
+    chofer = choferes.get(numero)
+
+    if not chofer:
+        return False
+
+    chofer["activo"] = False
+    chofer["estado"] = "DESCONECTADO"
+    chofer["viaje_actual"] = None
+    chofer["ultima_actualizacion"] = ahora()
+
+    return True
+
+
+def actualizar_ubicacion_chofer(numero, latitud, longitud):
+
+    chofer = choferes.get(numero)
+
+    if not chofer:
+        return False
+
+    chofer["latitud"] = float(latitud)
+    chofer["longitud"] = float(longitud)
+    chofer["ultima_actualizacion"] = ahora()
+
+    return True
+
+
+# ============================================================
+# MOTOR DE VIAJES
+# ============================================================
+
+def crear_viaje(cliente_numero, origen, destino):
+
+    global contador_viajes
+
+    viaje_id = contador_viajes
+    contador_viajes += 1
+
+    disponibles = obtener_choferes_disponibles(origen)
+
+    viaje = {
+        "id": viaje_id,
+        "cliente": cliente_numero,
+        "origen": origen,
+        "destino": destino,
+        "estado": "BUSCANDO_CHOFER",
+        "chofer_asignado": None,
+        "candidatos": disponibles,
+        "indice_candidato": 0,
+        "creado": ahora()
+    }
+
+    viajes[viaje_id] = viaje
+
+    ofrecer_siguiente_chofer(viaje_id)
+
+    return viaje
+
+
+def ofrecer_siguiente_chofer(viaje_id):
+
+    viaje = viajes.get(viaje_id)
+
+    if not viaje:
+        return False
+
+    candidatos = viaje["candidatos"]
+    indice = viaje["indice_candidato"]
+
+    while indice < len(candidatos):
+
+        candidato = candidatos[indice]
+        numero = candidato["numero"]
+
+        chofer = choferes.get(numero)
+
+        if (
+            chofer
+            and chofer["activo"]
+            and chofer["estado"] == "DISPONIBLE"
+        ):
+
+            viaje["indice_candidato"] = indice
+            viaje["chofer_ofrecido"] = numero
+            viaje["estado"] = "ESPERANDO_RESPUESTA"
+
+            chofer["estado"] = "OFERTA"
+            chofer["viaje_actual"] = viaje_id
+
+            enviar_mensaje(
+                numero,
+                "🚗 NUEVO VIAJE\n\n"
+                f"Viaje #{viaje_id}\n"
+                f"Destino: {viaje['destino']}\n"
+                f"Distancia al pasajero: "
+                f"{candidato['distancia_km']} km\n\n"
+                "Respondé:\n"
+                "ACEPTAR\n"
+                "o\n"
+                "RECHAZAR"
+            )
+
+            return True
+
+        indice += 1
+        viaje["indice_candidato"] = indice
+
+    viaje["estado"] = "SIN_CHOFER"
+
+    return False
+
+
+def aceptar_viaje(numero):
+
+    chofer = choferes.get(numero)
+
+    if not chofer:
+        return False, "Chofer no autorizado"
+
+    viaje_id = chofer.get("viaje_actual")
+
+    if not viaje_id:
+        return False, "No tenés viajes pendientes"
+
+    viaje = viajes.get(viaje_id)
+
+    if not viaje:
+        return False, "El viaje no existe"
+
+    if viaje.get("chofer_ofrecido") != numero:
+        return False, "Este viaje no está ofrecido a este chofer"
+
+    viaje["estado"] = "ASIGNADO"
+    viaje["chofer_asignado"] = numero
+
+    chofer["estado"] = "OCUPADO"
+
+    cliente = viaje["cliente"]
+
+    enviar_mensaje(
+        cliente,
+        "🚗 TU AUTO\n\n"
+        f"Chofer asignado: {chofer['nombre']}.\n"
+        "Tu vehículo está en camino."
+    )
+
+    return True, f"Viaje #{viaje_id} asignado"
+
+
+def rechazar_viaje(numero):
+
+    chofer = choferes.get(numero)
+
+    if not chofer:
+        return False, "Chofer no autorizado"
+
+    viaje_id = chofer.get("viaje_actual")
+
+    if not viaje_id:
+        return False, "No tenés viajes pendientes"
+
+    viaje = viajes.get(viaje_id)
+
+    if not viaje:
+        return False, "Viaje inexistente"
+
+    chofer["estado"] = "DISPONIBLE"
+    chofer["viaje_actual"] = None
+
+    viaje["indice_candidato"] += 1
+
+    ofrecer_siguiente_chofer(viaje_id)
+
+    return True, f"Viaje #{viaje_id} rechazado"
+
+
+# ============================================================
+# PROCESAMIENTO DE WHATSAPP
+# ============================================================
 
 def procesar_chofer(numero, mensaje):
 
-    chofer = choferes[numero]
-
     tipo = mensaje.get("type")
 
-    # UBICACION DEL CHOFER
     if tipo == "location":
 
         ubicacion = mensaje.get("location", {})
 
-        latitud = ubicacion.get("latitude")
-        longitud = ubicacion.get("longitude")
+        lat = ubicacion.get("latitude")
+        lon = ubicacion.get("longitude")
 
-        if latitud is None or longitud is None:
+        if lat is not None and lon is not None:
+
+            actualizar_ubicacion_chofer(
+                numero,
+                lat,
+                lon
+            )
+
             enviar_mensaje(
                 numero,
-                "⚠️ No pude leer tu ubicación. Intentá enviarla nuevamente."
+                "📍 Ubicación del chofer actualizada."
             )
-            return
-
-        chofer["ubicacion"] = {
-            "latitud": latitud,
-            "longitud": longitud
-        }
-
-        chofer["estado"] = "DISPONIBLE"
-
-        enviar_mensaje(
-            numero,
-            "🟢 TU AUTO\n\n"
-            "Estás ACTIVO y DISPONIBLE.\n\n"
-            "Ya podés recibir pedidos."
-        )
-
-        print(
-            "CHOFER DISPONIBLE:",
-            numero,
-            chofer["ubicacion"]
-        )
 
         return
 
@@ -185,128 +472,76 @@ def procesar_chofer(numero, mensaje):
         return
 
     texto = (
-        mensaje.get("text", {})
+        mensaje
+        .get("text", {})
         .get("body", "")
         .strip()
-        .lower()
+        .upper()
     )
 
-    # ACTIVAR
-    if texto == "activar":
+    if texto == "ACTIVAR":
 
-        chofer["estado"] = "ESPERANDO_UBICACION"
+        activar_chofer(numero)
 
-        pedir_ubicacion(
+        enviar_mensaje(
+            numero,
+            "🟢 Estás ACTIVO y DISPONIBLE.\n\n"
+            "Ahora compartí tu ubicación."
+        )
+
+        return
+
+    if texto == "DESCONECTAR":
+
+        desconectar_chofer(numero)
+
+        enviar_mensaje(
+            numero,
+            "🔴 Quedaste DESCONECTADO."
+        )
+
+        return
+
+    if texto == "ESTADO":
+
+        chofer = choferes[numero]
+
+        enviar_mensaje(
             numero,
             "🚗 TU AUTO - CHOFER\n\n"
-            "Para ACTIVARTE necesito tu ubicación.\n\n"
-            "Compartila usando el botón de abajo."
+            f"Estado: {chofer['estado']}\n"
+            f"Activo: {'Sí' if chofer['activo'] else 'No'}"
         )
 
         return
 
-    # DESCONECTAR
-    if texto in [
-        "desconectar",
-        "desactivar"
-    ]:
+    if texto == "ACEPTAR":
 
-        chofer["estado"] = "DESCONECTADO"
-        chofer["ubicacion"] = None
-
-        enviar_mensaje(
-            numero,
-            "🔴 TU AUTO\n\n"
-            "Quedaste DESCONECTADO.\n\n"
-            "No recibirás nuevos pedidos.\n\n"
-            "Cuando quieras volver escribí:\n"
-            "ACTIVAR"
-        )
+        ok, respuesta = aceptar_viaje(numero)
+        enviar_mensaje(numero, respuesta)
 
         return
 
-    # ESTADO
-    if texto == "estado":
+    if texto == "RECHAZAR":
 
-        estado = chofer["estado"]
-
-        enviar_mensaje(
-            numero,
-            f"🚗 TU AUTO\n\n"
-            f"Tu estado actual es:\n"
-            f"{estado}"
-        )
+        ok, respuesta = rechazar_viaje(numero)
+        enviar_mensaje(numero, respuesta)
 
         return
 
-    # AYUDA
     enviar_mensaje(
         numero,
         "🚗 TU AUTO - CHOFER\n\n"
-        "Comandos disponibles:\n\n"
+        "Comandos disponibles:\n"
         "ACTIVAR\n"
-        "DESCONECTAR\n"
-        "ESTADO"
+        "ESTADO\n"
+        "ACEPTAR\n"
+        "RECHAZAR\n"
+        "DESCONECTAR"
     )
 
-
-# =========================
-# BUSCAR CHOFER
-# =========================
-
-def buscar_chofer(cliente_numero):
-
-    viaje = clientes.get(cliente_numero)
-
-    if not viaje:
-        return
-
-    disponibles = []
-
-    for numero, datos in choferes.items():
-
-        if (
-            datos["estado"] == "DISPONIBLE"
-            and datos["ubicacion"] is not None
-        ):
-            disponibles.append(numero)
-
-    print("NUEVO VIAJE")
-    print("Cliente:", cliente_numero)
-    print("Origen:", viaje["origen"])
-    print("Destino:", viaje["destino"])
-    print("Choferes disponibles:", disponibles)
-
-    if not disponibles:
-
-        enviar_mensaje(
-            cliente_numero,
-            "🚗 TU AUTO\n\n"
-            "En este momento estamos buscando un conductor disponible.\n"
-            "Aguardá un momento."
-        )
-
-        return
-
-    # POR AHORA TOMAMOS EL PRIMERO.
-    # En el siguiente módulo se ordenarán por distancia.
-    chofer_numero = disponibles[0]
-
-    enviar_mensaje(
-        chofer_numero,
-        "🚗 NUEVO PEDIDO TU AUTO\n\n"
-        f"Destino: {viaje['destino']}\n\n"
-        "Próximamente podrás ACEPTAR o RECHAZAR el viaje."
-    )
-
-
-# =========================
-# CLIENTES
-# =========================
 
 def procesar_cliente(numero, mensaje):
-
-    tipo = mensaje.get("type")
 
     if numero not in clientes:
 
@@ -318,7 +553,8 @@ def procesar_cliente(numero, mensaje):
 
     cliente = clientes[numero]
 
-    # UBICACION CLIENTE
+    tipo = mensaje.get("type")
+
     if tipo == "location":
 
         ubicacion = mensaje.get("location", {})
@@ -333,8 +569,7 @@ def procesar_cliente(numero, mensaje):
         enviar_mensaje(
             numero,
             "📍 Ubicación recibida.\n\n"
-            "Ahora escribime a dónde querés ir.\n\n"
-            "Ejemplo: Hospital Bicentenario"
+            "Ahora escribime a dónde querés ir."
         )
 
         return
@@ -343,14 +578,14 @@ def procesar_cliente(numero, mensaje):
         return
 
     texto = (
-        mensaje.get("text", {})
+        mensaje
+        .get("text", {})
         .get("body", "")
         .strip()
     )
 
     texto_minuscula = texto.lower()
 
-    # DESTINO
     if cliente["estado"] == "ESPERANDO_DESTINO":
 
         cliente["destino"] = texto
@@ -360,10 +595,16 @@ def procesar_cliente(numero, mensaje):
             numero,
             "✅ Pedido recibido.\n\n"
             f"📍 Destino: {texto}\n\n"
-            "🚗 Estamos buscando un conductor disponible..."
+            "🚗 Buscando conductor disponible..."
         )
 
-        buscar_chofer(numero)
+        viaje = crear_viaje(
+            numero,
+            cliente["origen"],
+            texto
+        )
+
+        cliente["viaje_id"] = viaje["id"]
 
         return
 
@@ -402,10 +643,6 @@ def procesar_cliente(numero, mensaje):
     )
 
 
-# =========================
-# PROCESAR MENSAJE
-# =========================
-
 def procesar_mensaje(mensaje):
 
     numero = mensaje.get("from")
@@ -413,27 +650,43 @@ def procesar_mensaje(mensaje):
     if not numero:
         return
 
-    # Si es un número autorizado,
-    # siempre se procesa como chofer.
-    if numero in choferes:
-
-        procesar_chofer(
-            numero,
-            mensaje
-        )
-
+    # Si es uno de los numeros autorizados,
+    # se procesa como chofer.
+    if numero in CHOFERES_AUTORIZADOS:
+        procesar_chofer(numero, mensaje)
         return
 
-    # Los demás números son clientes.
-    procesar_cliente(
-        numero,
-        mensaje
-    )
+    # Cualquier otro numero se procesa como cliente.
+    procesar_cliente(numero, mensaje)
 
 
-# =========================
-# WEBHOOK
-# =========================
+# ============================================================
+# RUTAS PRINCIPALES
+# ============================================================
+
+@app.route("/", methods=["GET"])
+def inicio():
+
+    return jsonify({
+        "sistema": "TU AUTO",
+        "estado": "ONLINE",
+        "motor": "DESPACHO V1",
+        "choferes_prueba": len(choferes)
+    })
+
+
+@app.route("/webhook", methods=["GET"])
+def verificar_webhook():
+
+    mode = request.args.get("hub.mode")
+    token = request.args.get("hub.verify_token")
+    challenge = request.args.get("hub.challenge")
+
+    if mode == "subscribe" and token == VERIFY_TOKEN:
+        return challenge, 200
+
+    return "Error de verificacion", 403
+
 
 @app.route("/webhook", methods=["POST"])
 def recibir_webhook():
@@ -457,10 +710,183 @@ def recibir_webhook():
 
     except Exception as error:
 
-        print("ERROR:", error)
+        print("ERROR WEBHOOK:", error)
 
     return "EVENT_RECEIVED", 200
 
+
+# ============================================================
+# API DE PRUEBA
+# NO NECESITA WHATSAPP
+# ============================================================
+
+@app.route("/prueba", methods=["GET"])
+def prueba():
+
+    return jsonify({
+        "ok": True,
+        "mensaje": "Motor de TU AUTO funcionando",
+        "instrucciones": {
+            "ver_choferes": "/prueba/choferes",
+            "activar_chofer_1": "/prueba/activar/5493446614703",
+            "activar_chofer_2": "/prueba/activar/5493446411551"
+        }
+    })
+
+
+@app.route("/prueba/choferes", methods=["GET"])
+def prueba_choferes():
+
+    return jsonify(choferes)
+
+
+@app.route("/prueba/activar/<numero>", methods=["GET"])
+def prueba_activar(numero):
+
+    if numero not in choferes:
+
+        return jsonify({
+            "ok": False,
+            "error": "Chofer no autorizado"
+        }), 404
+
+    activar_chofer(numero)
+
+    return jsonify({
+        "ok": True,
+        "mensaje": "Chofer activado",
+        "chofer": choferes[numero]
+    })
+
+
+@app.route("/prueba/desconectar/<numero>", methods=["GET"])
+def prueba_desconectar(numero):
+
+    if numero not in choferes:
+
+        return jsonify({
+            "ok": False,
+            "error": "Chofer no autorizado"
+        }), 404
+
+    desconectar_chofer(numero)
+
+    return jsonify({
+        "ok": True,
+        "mensaje": "Chofer desconectado",
+        "chofer": choferes[numero]
+    })
+
+
+@app.route("/prueba/ubicacion/<numero>", methods=["GET"])
+def prueba_ubicacion(numero):
+
+    if numero not in choferes:
+
+        return jsonify({
+            "ok": False,
+            "error": "Chofer no autorizado"
+        }), 404
+
+    lat = request.args.get("lat")
+    lon = request.args.get("lon")
+
+    if lat is None or lon is None:
+
+        return jsonify({
+            "ok": False,
+            "error": "Faltan lat y lon"
+        }), 400
+
+    actualizar_ubicacion_chofer(
+        numero,
+        lat,
+        lon
+    )
+
+    return jsonify({
+        "ok": True,
+        "mensaje": "Ubicacion actualizada",
+        "chofer": choferes[numero]
+    })
+
+
+@app.route("/prueba/viaje", methods=["GET"])
+def prueba_viaje():
+
+    lat = request.args.get("lat")
+    lon = request.args.get("lon")
+    destino = request.args.get(
+        "destino",
+        "Hospital Bicentenario"
+    )
+
+    if lat is None or lon is None:
+
+        return jsonify({
+            "ok": False,
+            "error": "Faltan lat y lon"
+        }), 400
+
+    origen = {
+        "latitud": float(lat),
+        "longitud": float(lon)
+    }
+
+    viaje = crear_viaje(
+        "CLIENTE_PRUEBA",
+        origen,
+        destino
+    )
+
+    return jsonify({
+        "ok": True,
+        "viaje": viaje
+    })
+
+
+@app.route("/prueba/aceptar/<numero>", methods=["GET"])
+def prueba_aceptar(numero):
+
+    ok, mensaje = aceptar_viaje(numero)
+
+    return jsonify({
+        "ok": ok,
+        "mensaje": mensaje
+    })
+
+
+@app.route("/prueba/rechazar/<numero>", methods=["GET"])
+def prueba_rechazar(numero):
+
+    ok, mensaje = rechazar_viaje(numero)
+
+    return jsonify({
+        "ok": ok,
+        "mensaje": mensaje
+    })
+
+
+@app.route("/prueba/viajes", methods=["GET"])
+def prueba_ver_viajes():
+
+    return jsonify(viajes)
+
+
+@app.route("/estado", methods=["GET"])
+def estado_general():
+
+    return jsonify({
+        "sistema": "TU AUTO",
+        "choferes": choferes,
+        "viajes": viajes,
+        "clientes": clientes
+    })
+
+
+# ============================================================
+# INICIO
+# ============================================================
 
 if __name__ == "__main__":
 
